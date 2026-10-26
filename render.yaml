@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: widevine-drm-api
+    runtime: node
+    plan: free
+    buildCommand: bash build.sh
+    startCommand: node server.js
+    envVars:
+      - key: PYTHON3_PATH
+        value: python3
+      - key: NODE_ENV
+        value: production

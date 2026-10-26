@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+Widevine DRM Processor — API backend script
+============================================
+Usage: python3 wv_process.py <json_args>
+
+Input JSON:
+  {
+    "processurl": "<MPD_URL or preset name>",
+    "license_url": "<optional license URL>",
+    "pssh": "<optional PSSH base64>"
+  }
+
+Output JSON:
+  {
+    "status": "success",
+    "session_id": "...",
+    "mpd_url": "...",
+    "license_url": "...",
+    "pssh": "...",
+    "keys": [{"kid": "...", "key": "..."}],
+    "keys_hex": ["KID:KEY", ...],
+    "clearkeys": {"KID_b64url": "KEY_b64url", ...},
+    "download_cmd": "yt-dlp ..."
+  }
+"""
+
+import sys
+import os
+import re
+import json
+import time
+import base64
+import hashlib
+import requests
+from bs4 import BeautifulSoup
+
+# ─── pywidevine ───────────────────────────────────────────────────────
+from pywidevine.cdm import Cdm
+from pywidevine.device import Device, DeviceTypes
+from pywidevine.pssh import PSSH
+
+# ─── CDM FILES ────────────────────────────────────────────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CDM_DIR = os.path.join(SCRIPT_DIR, "cdm")
+PRIVATE_KEY = os.path.join(CDM_DIR, "private_key.der")
+CLIENT_ID = os.path.join(CDM_DIR, "client_id.bin")
+
+# ─── PRESETS ──────────────────────────────────────────────────────────
+# Add your own presets here for easy reuse
+PRESETS = {
+    "bitmovin": {
+        "mpd": "https://cdn.bitmovin.com/content/assets/art-of-motion_drm/mpds/11331.mpd",
+        "lic": "https://cwip-shaka-proxy.appspot.com/no_auth",
+        "pssh": "AAAAW3Bzc2gAAAAA7e+LqXnWSs6jyCfc1R0h7QAAADsIARIQ62dqu8s0Xpa7z2FmMPGj2hoNd2lkZXZpbmVfdGVzdCIQZmtqM2xqYVNkZmFsa3IzaioCSEQyAA==",
+    },
+    "tears": {
+        "mpd": "https://storage.googleapis.com/wvmedia/cenc/h264/tears/tears.mpd",
+        "lic": "https://cwip-shaka-proxy.appspot.com/no_auth",
+    },
+    "tears_vp9": {
+        "mpd": "https://storage.googleapis.com/wvmedia/cenc/vp9/tears/tears.mpd",
+        "lic": "https://cwip-shaka-proxy.appspot.com/no_auth",
+    },
+    "axinom_cbcs": {
+        "mpd": "https://media.axprod.net/TestVectors/Cmaf/protected_1080p_h264_cbcs/manifest.mpd",
+        "lic": None,
+        "inline_keys": [
+            {"kid": "302f80dd411e4886bca5bb1f8018a024", "key": "15b2aaf906ebec6309d40f91289127b8"}
+        ],
+    },
+}
+
+# Inline-keys registry: MPD URL prefix → keys (license server not required)
+# Add known keys for sites that don't have a working license server
+INLINE_KEY_MAP = {
+    "media.axprod.net/testvectors/cmaf/protected_1080p_h264_cbcs": [
+        {"kid": "302f80dd411e4886bca5bb1f8018a024", "key": "15b2aaf906ebec6309d40f91289127b8"}
+    ],
+}
+
+DEFAULT_LIC = "https://cwip-shaka-proxy.appspot.com/no_auth"
+
+# ─── CDM SINGLETON ────────────────────────────────────────────────────
+_cdm = None
+
+def get_cdm():
+    global _cdm
+    if _cdm is not None:
+        return _cdm
+    with open(PRIVATE_KEY, "rb") as f:
+        pk = f.read()
+    with open(CLIENT_ID, "rb") as f:
+        ci = f.read()
+    device = Device(type_=DeviceTypes.ANDROID, security_level=3, flags=None,
+                    private_key=pk, client_id=ci)
+    _cdm = Cdm.from_device(device)
+    return _cdm
+
+
+# ─── MPD FETCHING ─────────────────────────────────────────────────────
+def fetch_mpd(mpd_url: str) -> str | None:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Referer": "https://bitmovin.com/demos/drm/",
+    }
+    try:
+        r = requests.get(mpd_url, headers=headers, timeout=15)
+        if r.status_code == 200 and "<MPD" in r.text:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+# ─── PSSH EXTRACTION ──────────────────────────────────────────────────
+def extract_pssh(mpd_xml: str) -> list[str]:
+    pssh_list = []
+    soup = BeautifulSoup(mpd_xml, "xml")
+    for tag in soup.find_all("cenc:pssh"):
+        val = tag.get_text(strip=True)
+        if val and val not in pssh_list:
+            pssh_list.append(val)
+    WV_UUID = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+    for cp in soup.find_all("ContentProtection"):
+        if WV_UUID in cp.get("schemeIdUri", "").lower():
+            for ptag in cp.find_all("cenc:pssh"):
+                val = ptag.get_text(strip=True)
+                if val and val not in pssh_list:
+                    pssh_list.append(val)
+    if not pssh_list:
+        for m in re.findall(r"<cenc:pssh[^>]*>(.*?)</cenc:pssh>", mpd_xml, re.DOTALL):
+            val = m.strip()
+            if val and val not in pssh_list:
+                pssh_list.append(val)
+    return pssh_list
+
+
+# ─── DRM KEY GENERATION ──────────────────────────────────────────────
+def get_keys(pssh_b64: str, license_url: str) -> list[dict]:
+    cdm = get_cdm()
+    pssh = PSSH(pssh_b64)
+    sid = cdm.open()
+    try:
+        challenge = cdm.get_license_challenge(sid, pssh)
+        resp = requests.post(license_url, data=challenge,
+                             headers={"Content-Type": "application/octet-stream"},
+                             timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f"License server HTTP {resp.status_code}")
+        cdm.parse_license(sid, resp.content)
+        keys = []
+        for key in cdm.get_keys(sid):
+            if key.type == "CONTENT":
+                keys.append({"kid": key.kid.hex, "key": key.key.hex()})
+        return keys
+    finally:
+        cdm.close(sid)
+
+
+# ─── MAIN PROCESSOR ──────────────────────────────────────────────────
+def process(args: dict) -> dict:
+    processurl = args.get("processurl", "").strip()
+    license_url = args.get("license_url", "").strip()
+    pssh_input = args.get("pssh", "").strip()
+
+    if not processurl:
+        return {"status": "error", "message": "Missing processurl"}
+
+    # Resolve preset
+    preset = PRESETS.get(processurl.lower())
+    inline_keys = None
+    if preset:
+        mpd_url = preset["mpd"]
+        if not license_url:
+            license_url = preset.get("lic") or DEFAULT_LIC
+        pssh_input = pssh_input or preset.get("pssh", "")
+        inline_keys = preset.get("inline_keys")
+    else:
+        mpd_url = processurl
+
+    # Inline-keys auto-match by URL prefix
+    if not inline_keys:
+        low = mpd_url.lower()
+        for prefix, k in INLINE_KEY_MAP.items():
+            if low.startswith("https://" + prefix) or prefix in low:
+                inline_keys = k
+                break
+
+    # Step 1: Get PSSH
+    if inline_keys:
+        pssh_input = pssh_input or ""
+    elif not pssh_input:
+        mpd_xml = fetch_mpd(mpd_url)
+        if mpd_xml:
+            pssh_list = extract_pssh(mpd_xml)
+            if pssh_list:
+                pssh_input = pssh_list[0]
+        if not pssh_input and "bitmovin.com" in mpd_url:
+            bp = PRESETS["bitmovin"]
+            pssh_input = bp["pssh"]
+            if not license_url:
+                license_url = bp["lic"]
+
+    if not pssh_input and not inline_keys:
+        return {"status": "error", "message": "No PSSH found. Provide pssh parameter directly."}
+
+    if not license_url and not inline_keys:
+        license_url = DEFAULT_LIC
+
+    # Step 2: Get DRM keys
+    if inline_keys:
+        content_keys = inline_keys
+    else:
+        content_keys = get_keys(pssh_input, license_url)
+    if not content_keys:
+        return {"status": "error", "message": "No CONTENT keys from license server.",
+                "pssh": pssh_input, "license_url": license_url}
+
+    # Step 3: Build response
+    session_id = hashlib.md5(f"{mpd_url}{time.time()}".encode()).hexdigest()[:12]
+    keys_hex = [f"{k['kid']}:{k['key']}" for k in content_keys]
+
+    def _b64url(hexstr: str) -> str:
+        return base64.urlsafe_b64encode(bytes.fromhex(hexstr)).rstrip(b"=").decode()
+
+    clearkeys = {_b64url(k["kid"]): _b64url(k["key"]) for k in content_keys}
+
+    key_args = " ".join([f"--decryption-key {kh}" for kh in keys_hex])
+    download_cmd = f'yt-dlp --allow-unplayable-formats {key_args} "{mpd_url}"'
+
+    return {
+        "status": "success",
+        "session_id": session_id,
+        "mpd_url": mpd_url,
+        "license_url": license_url,
+        "pssh": pssh_input,
+        "keys": content_keys,
+        "keys_hex": keys_hex,
+        "clearkeys": clearkeys,
+        "download_cmd": download_cmd,
+    }
+
+
+# ─── CLI ENTRY ────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print(json.dumps({"status": "error", "message": "Usage: wv_process.py '<json_args>'"}))
+        sys.exit(1)
+
+    try:
+        args = json.loads(sys.argv[1])
+    except json.JSONDecodeError as e:
+        print(json.dumps({"status": "error", "message": f"Invalid JSON: {e}"}))
+        sys.exit(1)
+
+    try:
+        result = process(args)
+        print(json.dumps(result))
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        print(json.dumps({"status": "error", "message": str(e), "type": type(e).__name__}))
+        sys.exit(1)
